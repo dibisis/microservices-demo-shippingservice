@@ -1,0 +1,135 @@
+version: 2.1
+
+orbs:
+  aws-eks: circleci/aws-eks@0.2.3
+  kubernetes: circleci/kubernetes@0.11.1
+
+jobs:
+  build-and-push:
+    docker:
+      - image: circleci/buildpack-deps:stretch
+    steps:
+      - checkout
+      - setup_remote_docker:
+          version: 19.03.12
+      - run:
+          name: Build Docker image
+          command: docker build -t $CIRCLE_PROJECT_USERNAME/$CIRCLE_PROJECT_REPONAME:${CIRCLE_SHA1:0:7} ./src/shippingservice
+      - run:
+          name: Push Docker Image to docker hub
+          command: |
+            echo "$DOCKERHUB_PASS" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
+            docker push $CIRCLE_PROJECT_USERNAME/$CIRCLE_PROJECT_REPONAME:${CIRCLE_SHA1:0:7}
+  deploy-application:
+    #    version: 2.1
+    executor: aws-eks/python3
+    #    docker:
+    #      - image: circleci/buildpack-deps:stretch
+    parameters:
+      cluster-name:
+        description: |
+          Name of the EKS cluster
+        type: string
+      docker-image-name:
+        description: |
+          Name of the docker image to be deployed
+        type: string
+      version-info:
+        description: |
+          App version information
+        type: string
+      aws-region:
+        description: |
+          AWS region
+        type: string
+        default: ""
+    steps:
+      - checkout
+      - run:
+          name: Create deployment manifest
+          command: |
+            # Replace the placeholders in the manifest with the intended values.
+            # This is to avoid hardcoding the image name in the manifest, to make this
+            # demo project more portable.
+            BUILD_DATE=$(date '+%Y%m%d%H%M%S')
+            cat kubernetes-manifests/shippingservice.yaml.template |\
+               sed "s|DOCKER_IMAGE_NAME|<< parameters.docker-image-name >>|\
+                g;s|BUILD_DATE_VALUE|$BUILD_DATE|g;s|VERSION_INFO_VALUE|\
+                << parameters.version-info >>|g" > kubernetes-manifests/shippingservice.yaml
+            cat kubernetes-manifests/shippingservice.yaml
+      - aws-eks/update-kubeconfig-with-authenticator:
+          cluster-name: msa-demo
+          install-kubectl: true
+          aws-region: ap-northeast-2
+      - kubernetes/create-or-update-resource:
+          resource-file-path: "kubernetes-manifests/shippingservice.yaml"
+          get-rollout-status: true
+          resource-name: "deployment/shippingservice"
+          show-kubectl-command: true
+  test-application:
+    executor: aws-eks/python3
+    parameters:
+      cluster-name:
+        description: |
+          Name of the EKS cluster
+        type: string
+      aws-region:
+        description: |
+          AWS region
+        type: string
+        default: ""
+#      expected-version-info:
+#        description: |
+#          Expected app version (this is used for testing that the
+#          correct version has been deployed)
+#        type: string
+    steps:
+      - aws-eks/update-kubeconfig-with-authenticator:
+          cluster-name: << parameters.cluster-name >>
+          install-kubectl: true
+          aws-region: << parameters.aws-region >>
+      - run:
+          name: Wait for service to be ready
+          command: |
+            kubectl get pods
+            kubectl get services
+#            sleep 10
+#            for attempt in {1..20}; do
+#              EXTERNAL_IP=$(kubectl get service frontend-external | awk '{print $4}' | tail -n1)
+#              echo "Checking external IP: ${EXTERNAL_IP}"
+#              if [ -n "${EXTERNAL_IP}" ] && [ -z $(echo "${EXTERNAL_IP}" | grep "pending") ]; then
+#                break
+#              fi
+#              echo "Waiting for external IP to be ready: ${EXTERNAL_IP}"
+#              sleep 10
+#            done
+#            sleep 30
+#            curl -s --retry 10 "http://$EXTERNAL_IP/_healthz"
+workflows:
+  version: 2
+  build-master:
+    jobs:
+      - build-and-push:
+          context:
+            - dockerhub
+          filters:
+            branches:
+              only: master
+      - deploy-application:
+          context:
+            - awsauthdibisis
+          cluster-name: msa-demo
+          aws-region: ap-northeast-2
+          docker-image-name: "$CIRCLE_PROJECT_USERNAME/$CIRCLE_PROJECT_REPONAME:${CIRCLE_SHA1:0:7}"
+          version-info: "${CIRCLE_SHA1:0:7}"
+          requires:
+            - build-and-push
+      - test-application:
+          context:
+            - awsauthdibisis
+          name: test-application
+          cluster-name: msa-demo
+          aws-region: ap-northeast-2
+#          expected-version-info: "${CIRCLE_SHA1:0:7}"
+          requires:
+            - deploy-application
